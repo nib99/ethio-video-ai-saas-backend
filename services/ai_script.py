@@ -1,3 +1,4 @@
+import os
 from openai import AsyncOpenAI
 import json
 import logging
