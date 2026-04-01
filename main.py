@@ -148,7 +148,7 @@ async def analytics(
         "total_videos": total,
         "completed": completed,
         "credits_spent": spent,
-        "estimated_roi": f"\~{(completed * 0.15):.2f} USD (based on avg view value)",
+        "estimated_roi": f"\\~{(completed * 0.15):.2f} USD (based on avg view value)",
         "recent_jobs": db.query(Job)
             .filter(Job.user_id == user.id)
             .order_by(Job.created_at.desc())
