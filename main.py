@@ -2,14 +2,24 @@ import os
 import uuid
 import stripe
 import logging
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Request
+
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Request, Body
 from fastapi.staticfiles import StaticFiles
+
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+
 from database import SessionLocal, User, Job
 from services.pipeline import run_pipeline
 from services.webhooks import process_stripe_webhook
-from services.auth import get_current_user
+
+# ✅ Merge auth imports here
+from services.auth import (
+    get_current_user, 
+    get_password_hash, 
+    verify_password, 
+    create_access_token
+)
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +48,37 @@ class GenerateRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     email: str
     plan: str = "pay_per_video"
+    
+# ====================== SIGNUP / LOGIN ======================
+@app.post("/api/signup")
+def signup(email: str = Body(...), password: str = Body(...), db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+    
+    hashed = get_password_hash(password)
+    user = User(email=email, hashed_password=hashed, credits=10)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    
+    token = create_access_token({"sub": str(user.id)})
+    return {
+        "user": {"id": user.id, "email": user.email, "credits": user.credits},
+        "token": token
+    }
 
+@app.post("/api/login")
+def login(email: str = Body(...), password: str = Body(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    token = create_access_token({"sub": str(user.id)})
+    return {
+        "user": {"id": user.id, "email": user.email, "credits": user.credits},
+        "token": token
+    }
 # ====================== STRIPE CHECKOUT ======================
 @app.post("/api/create-checkout")
 async def create_checkout(request: CheckoutRequest):
@@ -148,7 +188,7 @@ async def analytics(
         "total_videos": total,
         "completed": completed,
         "credits_spent": spent,
-        "estimated_roi": f"\\~{(completed * 0.15):.2f} USD (based on avg view value)",
+        "estimated_roi": f"\~{(completed * 0.15):.2f} USD (based on avg view value)",
         "recent_jobs": db.query(Job)
             .filter(Job.user_id == user.id)
             .order_by(Job.created_at.desc())
