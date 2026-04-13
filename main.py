@@ -3,17 +3,16 @@ import uuid
 import stripe
 import logging
 
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Request, Body
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from database import SessionLocal, User, Job
 from services.pipeline import run_pipeline
 from services.webhooks import process_stripe_webhook
 
-# ✅ Merge auth imports here
+# Auth imports
 from services.auth import (
     get_current_user, 
     get_password_hash, 
@@ -40,6 +39,16 @@ def get_db():
     finally:
         db.close()
 
+# ====================== AUTH MODELS ======================
+class SignupRequest(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
 class GenerateRequest(BaseModel):
     text: str
     language: str = "Amharic"
@@ -48,37 +57,66 @@ class GenerateRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     email: str
     plan: str = "pay_per_video"
-    
-# ====================== SIGNUP / LOGIN ======================
+
+
+# ====================== SIGNUP ======================
 @app.post("/api/signup")
-def signup(email: str = Body(...), password: str = Body(...), db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == email).first()
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == request.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
     
-    hashed = get_password_hash(password)
-    user = User(email=email, hashed_password=hashed, credits=10)
+    if len(request.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    hashed = get_password_hash(request.password)
+    
+    user = User(
+        email=request.email,
+        full_name=request.full_name,
+        hashed_password=hashed,
+        credits=10.0
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
     
-    token = create_access_token({"sub": str(user.id)})
+    token = create_access_token({"sub": str(user.id), "email": user.email})
+    
     return {
-        "user": {"id": user.id, "email": user.email, "credits": user.credits},
+        "message": "Account created successfully!",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "credits": user.credits
+        },
         "token": token
     }
 
+
+# ====================== LOGIN ======================
 @app.post("/api/login")
-def login(email: str = Body(...), password: str = Body(...), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not verify_password(password, user.hashed_password):
+def login(request: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == request.email).first()
+    
+    if not user or not verify_password(request.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    token = create_access_token({"sub": str(user.id)})
+    token = create_access_token({"sub": str(user.id), "email": user.email})
+    
     return {
-        "user": {"id": user.id, "email": user.email, "credits": user.credits},
+        "message": "Login successful",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name or "",
+            "credits": user.credits
+        },
         "token": token
     }
+
+
 # ====================== STRIPE CHECKOUT ======================
 @app.post("/api/create-checkout")
 async def create_checkout(request: CheckoutRequest):
@@ -89,19 +127,18 @@ async def create_checkout(request: CheckoutRequest):
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
-                "price": os.getenv("STRIPE_PRICE_ID"),   # Make sure this is set in .env
+                "price": os.getenv("STRIPE_PRICE_ID"),
                 "quantity": 1
             }],
             mode="payment",
-            success_url="https://your-frontend-domain.com/success?session_id={CHECKOUT_SESSION_ID}",  # ← CHANGE THIS
-            cancel_url="https://your-frontend-domain.com/dashboard/credits",                        # ← CHANGE THIS
+            success_url="https://your-frontend-domain.com/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://your-frontend-domain.com/dashboard/credits",
             customer_email=request.email,
             metadata={
                 "email": request.email,
                 "plan": request.plan
             }
         )
-
         return {"checkout_url": session.url}
 
     except stripe.error.StripeError as e:
@@ -110,6 +147,7 @@ async def create_checkout(request: CheckoutRequest):
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
 
 # ====================== STRIPE WEBHOOK ======================
 @app.post("/api/webhook/stripe")
@@ -128,6 +166,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
     return {"status": "success"}
 
+
 # ====================== VIDEO GENERATION ======================
 @app.post("/api/generate-cinematic-video")
 async def start_generation(
@@ -141,18 +180,17 @@ async def start_generation(
 
     job_id = str(uuid.uuid4())
     
-    # Start background job
     bg.add_task(run_pipeline, job_id, req.text, req.language, req.tier, user.id)
     
-    # Deduct credits immediately
     user.credits -= 2
     db.commit()
 
     return {
         "job_id": job_id,
         "status": "processing",
-        "message": "Video generation started. Check status with /api/status/{job_id}"
+        "message": "Video generation started."
     }
+
 
 # ====================== JOB STATUS ======================
 @app.get("/api/status/{job_id}")
@@ -171,6 +209,7 @@ async def get_status(
 
     return job
 
+
 # ====================== ANALYTICS ======================
 @app.get("/api/analytics")
 async def analytics(
@@ -179,8 +218,7 @@ async def analytics(
 ):
     total = db.query(Job).filter(Job.user_id == user.id).count()
     completed = db.query(Job).filter(
-        Job.user_id == user.id,
-        Job.status == "completed"
+        Job.user_id == user.id, Job.status == "completed"
     ).count()
     spent = db.query(Job).filter(Job.user_id == user.id).count() * 2
 
@@ -188,13 +226,14 @@ async def analytics(
         "total_videos": total,
         "completed": completed,
         "credits_spent": spent,
-        "estimated_roi": f"\~{(completed * 0.15):.2f} USD (based on avg view value)",
+        "estimated_roi": f"\~{(completed * 0.15):.2f} USD",
         "recent_jobs": db.query(Job)
             .filter(Job.user_id == user.id)
             .order_by(Job.created_at.desc())
             .limit(5)
             .all()
     }
+
 
 # ====================== HEALTH CHECK ======================
 @app.get("/")
